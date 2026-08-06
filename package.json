@@ -1,14 +1,15 @@
-
 {
   "name": "ghostcap-server",
   "version": "1.0.0",
-  "description": "Signaling Server for GhostCap",
+  "description": "GhostCap WebRTC Signaling Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "ws": "^8.16.0",
-    "firebase-admin": "^12.0.0"
+    "ws": "^8.18.0"
   }
 }
