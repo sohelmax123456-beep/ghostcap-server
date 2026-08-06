@@ -1,96 +1,119 @@
-
 const WebSocket = require('ws');
-const admin = require('firebase-admin');
+const http = require('http');
 
-// Render Environment Variable se Firebase Admin load karo
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    try {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        console.log("Firebase Admin Initialized Successfully!");
-    } catch (e) {
-        console.error("Firebase Initialization Failed:", e);
-    }
-} else {
-    console.warn("FIREBASE_SERVICE_ACCOUNT environment variable missing!");
-}
+const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
-const rooms = {};
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('GhostCap Signaling Server Active');
+});
+
+const wss = new WebSocket.Server({ server });
+
+// Map: roomId -> { host: socket, receiver: socket }
+const rooms = new Map();
 
 wss.on('connection', (ws) => {
-    console.log('New Client Connected');
+    console.log('Client connected');
+    let currentRoomId = null;
 
-    ws.on('message', async (message) => {
+    ws.on('message', (data) => {
         try {
-            const data = JSON.parse(message);
+            const msg = JSON.parse(data.toString());
+            const { type, roomId } = msg;
 
-            // 1. Host Room Create Karta Hai
-            if (data.type === 'create_room') {
-                rooms[data.roomId] = { host: ws, receiver: null };
-                ws.roomId = data.roomId;
-                ws.isHost = true;
-                console.log(`Room created: ${data.roomId}`);
-            } 
-            // 2. Controller Join Karta Hai
-            else if (data.type === 'join_room') {
-                const room = rooms[data.roomId];
-                
-                // Agar Host offline hai, toh FCM Silent Push bhej kar jagao
-                if (!room || !room.host) {
-                    console.log(`Host offline for room ${data.roomId}. Sending Silent FCM Wake-Up...`);
-                    
-                    if (admin.apps.length > 0) {
-                        const payload = {
-                            data: {
-                                action: "WAKE_UP",
-                                roomId: data.roomId
-                            },
-                            topic: `room_${data.roomId}`
-                        };
+            switch (type) {
+                case 'create_room':
+                case 'join_room':
+                case 'identify_host':
+                case 'identify_client':
+                    if (!roomId) return;
 
-                        try {
-                            await admin.messaging().send(payload);
-                            console.log("FCM Silent Notification Sent!");
-                        } catch (error) {
-                            console.error("FCM Send Error:", error);
+                    // 1. Cleanup: If this socket was already in a room, remove it
+                    if (currentRoomId && rooms.has(currentRoomId)) {
+                        const r = rooms.get(currentRoomId);
+                        if (r.host === ws) r.host = null;
+                        if (r.receiver === ws) r.receiver = null;
+                        if (!r.host && !r.receiver) rooms.delete(currentRoomId);
+                    }
+
+                    currentRoomId = roomId;
+
+                    if (!rooms.has(roomId)) {
+                        // 2. Assign HOST: First client to join becomes the Host
+                        rooms.set(roomId, { host: ws, receiver: null });
+                        console.log(`[Room ${roomId}] Host registered`);
+                        
+                        // Send success confirmation matching SignalingClient expectations
+                        const response = (type === 'create_room' || type === 'identify_host') 
+                            ? 'room_created' : 'joined_successfully';
+                        ws.send(JSON.stringify({ type: response, roomId }));
+                    } else {
+                        const room = rooms.get(roomId);
+                        
+                        // Duplicate socket protection
+                        if (room.host === ws || room.receiver === ws) return;
+
+                        if (!room.receiver) {
+                            // 3. Assign RECEIVER: Second client to join becomes the Receiver
+                            room.receiver = ws;
+                            console.log(`[Room ${roomId}] Receiver registered`);
+                            
+                            ws.send(JSON.stringify({ type: 'joined_successfully', roomId }));
+                            
+                            // 4. Trigger Handshake: ONLY notify Host that Peer Joined
+                            if (room.host && room.host.readyState === WebSocket.OPEN) {
+                                console.log(`[Room ${roomId}] Notifying Host to start capture`);
+                                room.host.send(JSON.stringify({ type: 'peer_joined', roomId }));
+                            }
+                        } else {
+                            // 5. Duplicate room protection: Prevent 3rd wheel
+                            console.log(`[Room ${roomId}] Connection rejected: Room full`);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Room already full' }));
                         }
                     }
-                } else {
-                    room.receiver = ws;
-                    ws.roomId = data.roomId;
-                    ws.isHost = false;
-                    console.log(`Receiver joined room: ${data.roomId}`);
-                }
-            } 
-            // 3. WebRTC Signaling Relaying (Offer, Answer, Candidates)
-            else {
-                const room = rooms[data.roomId];
-                if (room) {
-                    const target = ws.isHost ? room.receiver : room.host;
-                    if (target && target.readyState === WebSocket.OPEN) {
-                        target.send(JSON.stringify(data));
+                    break;
+
+                case 'offer':
+                case 'answer':
+                case 'candidate':
+                    // RELAY: Logic for relaying WebRTC data between Host and Receiver
+                    if (currentRoomId && rooms.has(currentRoomId)) {
+                        const room = rooms.get(currentRoomId);
+                        const target = (ws === room.host) ? room.receiver : room.host;
+                        
+                        if (target && target.readyState === WebSocket.OPEN) {
+                            target.send(JSON.stringify(msg));
+                        }
                     }
-                }
+                    break;
             }
-        } catch (err) {
-            console.error("Message processing error:", err);
+        } catch (e) {
+            console.error('Signaling relay error:', e);
         }
     });
 
     ws.on('close', () => {
-        if (ws.roomId && rooms[ws.roomId]) {
-            if (ws.isHost) {
-                delete rooms[ws.roomId];
-            } else {
-                rooms[ws.roomId].receiver = null;
+        if (currentRoomId && rooms.has(currentRoomId)) {
+            const room = rooms.get(currentRoomId);
+            if (ws === room.host) {
+                console.log(`[Room ${currentRoomId}] Host left. Closing room.`);
+                // Notify Receiver if Host leaves
+                if (room.receiver && room.receiver.readyState === WebSocket.OPEN) {
+                    room.receiver.send(JSON.stringify({ type: 'error', message: 'Host disconnected' }));
+                }
+                rooms.delete(currentRoomId);
+            } else if (ws === room.receiver) {
+                console.log(`[Room ${currentRoomId}] Receiver left.`);
+                room.receiver = null;
             }
         }
-        console.log('Client Disconnected');
+        console.log('Client disconnected');
     });
+
+    ws.on('error', (err) => console.error('WebSocket Error:', err));
 });
 
-console.log(`Signaling server running on port ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`GhostCap Server running on port ${PORT}`);
+});
