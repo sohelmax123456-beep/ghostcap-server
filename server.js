@@ -1,3 +1,4 @@
+
 const WebSocket = require('ws');
 const http = require('http');
 
@@ -23,89 +24,89 @@ wss.on('connection', (ws) => {
             const { type, roomId } = msg;
 
             switch (type) {
+                // 1. Explicit Host Registration
                 case 'create_room':
-                case 'join_room':
-                case 'identify_host':
-                case 'identify_client':
+                case 'identify_host': {
                     if (!roomId) return;
-
-                    // 1. Cleanup: If this socket was already in a room, remove it
-                    if (currentRoomId && rooms.has(currentRoomId)) {
-                        const r = rooms.get(currentRoomId);
-                        if (r.host === ws) r.host = null;
-                        if (r.receiver === ws) r.receiver = null;
-                        if (!r.host && !r.receiver) rooms.delete(currentRoomId);
-                    }
-
                     currentRoomId = roomId;
 
-                    if (!rooms.has(roomId)) {
-                        // 2. Assign HOST: First client to join becomes the Host
-                        rooms.set(roomId, { host: ws, receiver: null });
-                        console.log(`[Room ${roomId}] Host registered`);
-                        
-                        // Send success confirmation matching SignalingClient expectations
-                        const response = (type === 'create_room' || type === 'identify_host') 
-                            ? 'room_created' : 'joined_successfully';
-                        ws.send(JSON.stringify({ type: response, roomId }));
-                    } else {
-                        const room = rooms.get(roomId);
-                        
-                        // Duplicate socket protection
-                        if (room.host === ws || room.receiver === ws) return;
+                    let room = rooms.get(roomId) || { host: null, receiver: null };
+                    room.host = ws;
+                    rooms.set(roomId, room);
 
-                        if (!room.receiver) {
-                            // 3. Assign RECEIVER: Second client to join becomes the Receiver
-                            room.receiver = ws;
-                            console.log(`[Room ${roomId}] Receiver registered`);
-                            
-                            ws.send(JSON.stringify({ type: 'joined_successfully', roomId }));
-                            
-                            // 4. Trigger Handshake: ONLY notify Host that Peer Joined
-                            if (room.host && room.host.readyState === WebSocket.OPEN) {
-                                console.log(`[Room ${roomId}] Notifying Host to start capture`);
-                                room.host.send(JSON.stringify({ type: 'peer_joined', roomId }));
-                            }
-                        } else {
-                            // 5. Duplicate room protection: Prevent 3rd wheel
-                            console.log(`[Room ${roomId}] Connection rejected: Room full`);
-                            ws.send(JSON.stringify({ type: 'error', message: 'Room already full' }));
-                        }
+                    console.log(`[Room ${roomId}] Host registered explicitly`);
+                    ws.send(JSON.stringify({ type: 'room_created', roomId }));
+
+                    // Agar receiver pehle se wait kar raha tha, toh host ko trigger do
+                    if (room.receiver && room.receiver.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'peer_joined', roomId }));
                     }
                     break;
+                }
 
+                // 2. Explicit Client/Receiver Registration
+                case 'join_room':
+                case 'identify_client': {
+                    if (!roomId) return;
+                    currentRoomId = roomId;
+
+                    let room = rooms.get(roomId) || { host: null, receiver: null };
+                    room.receiver = ws;
+                    rooms.set(roomId, room);
+
+                    console.log(`[Room ${roomId}] Receiver registered explicitly`);
+                    ws.send(JSON.stringify({ type: 'joined_successfully', roomId }));
+
+                    // Host ko inform karo ki Peer aagaya hai (Offer generate karne ke liye)
+                    if (room.host && room.host.readyState === WebSocket.OPEN) {
+                        console.log(`[Room ${roomId}] Notifying Host to start SDP exchange`);
+                        room.host.send(JSON.stringify({ type: 'peer_joined', roomId }));
+                    }
+                    break;
+                }
+
+                // 3. WebRTC Relay (Offer / Answer / ICE Candidates)
                 case 'offer':
                 case 'answer':
-                case 'candidate':
-                    // RELAY: Logic for relaying WebRTC data between Host and Receiver
+                case 'candidate': {
                     if (currentRoomId && rooms.has(currentRoomId)) {
                         const room = rooms.get(currentRoomId);
                         const target = (ws === room.host) ? room.receiver : room.host;
-                        
+
                         if (target && target.readyState === WebSocket.OPEN) {
                             target.send(JSON.stringify(msg));
                         }
                     }
                     break;
+                }
             }
         } catch (e) {
-            console.error('Signaling relay error:', e);
+            console.error('Signaling error:', e);
         }
     });
 
     ws.on('close', () => {
         if (currentRoomId && rooms.has(currentRoomId)) {
             const room = rooms.get(currentRoomId);
+
             if (ws === room.host) {
-                console.log(`[Room ${currentRoomId}] Host left. Closing room.`);
-                // Notify Receiver if Host leaves
+                console.log(`[Room ${currentRoomId}] Host disconnected.`);
+                room.host = null;
                 if (room.receiver && room.receiver.readyState === WebSocket.OPEN) {
                     room.receiver.send(JSON.stringify({ type: 'error', message: 'Host disconnected' }));
                 }
-                rooms.delete(currentRoomId);
             } else if (ws === room.receiver) {
-                console.log(`[Room ${currentRoomId}] Receiver left.`);
+                console.log(`[Room ${currentRoomId}] Receiver disconnected.`);
                 room.receiver = null;
+                if (room.host && room.host.readyState === WebSocket.OPEN) {
+                    room.host.send(JSON.stringify({ type: 'peer_disconnected', message: 'Receiver left' }));
+                }
+            }
+
+            // Room cleanup jab dono disconnect ho jayein
+            if (!room.host && !room.receiver) {
+                rooms.delete(currentRoomId);
+                console.log(`[Room ${currentRoomId}] Deleted empty room.`);
             }
         }
         console.log('Client disconnected');
